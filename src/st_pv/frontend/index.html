@@ -1,0 +1,337 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font: 13px sans-serif; }
+  canvas { display: block; }
+  #msg { position: absolute; inset: 0; display: grid; place-items: center; color: #888; pointer-events: none; }
+  #bar { position: absolute; top: 6px; right: 6px; display: flex; gap: 2px; background: #fffd; border: 1px solid #ccc; border-radius: 6px; padding: 2px; }
+  #bar button { width: 30px; height: 28px; border: 0; border-radius: 4px; background: none; cursor: pointer; font-size: 16px; line-height: 1; color: #333; }
+  #bar button:hover { background: #0001; }
+  #bar button.on { background: #ff4b4b33; color: #c00; }
+  #brightBox { display: flex; align-items: center; gap: 2px; padding: 0 4px; font-size: 16px; color: #333; }
+  #bright { width: 80px; }
+  #bar .sep { width: 1px; background: #ccc; margin: 3px 2px; }
+  #layers { position: absolute; top: 42px; right: 6px; background: #fffe; border: 1px solid #ccc; border-radius: 6px; padding: 6px 10px; display: none; max-height: 60%; overflow: auto; }
+  #layers label { display: flex; gap: 6px; align-items: center; white-space: nowrap; }
+  #layers i { width: 10px; height: 10px; display: inline-block; border-radius: 2px; }
+  #info { position: absolute; left: 8px; bottom: 6px; color: #666; font-size: 12px; pointer-events: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="msg">Loading…</div>
+<div id="bar">
+  <button data-style="surface" class="on" title="Surface">◼</button>
+  <button data-style="wireframe" title="Wireframe">▦</button>
+  <button data-style="points" title="Points only">⁘</button>
+  <span class="sep"></span>
+  <button id="pan" title="Pan mode (or right / middle mouse button, arrow keys)">✥</button>
+  <button id="pick" title="Add points by clicking on the model">⊕</button>
+  <button id="undo" title="Remove last added point">↶</button>
+  <span class="sep"></span>
+  <label id="brightBox" title="Texture brightness">☀<input id="bright" type="range" min="0.2" max="3" step="0.05" value="1"></label>
+  <span class="sep"></span>
+  <button id="layersBtn" title="Layers">☰</button>
+  <button id="home" title="Reset view">⌂</button>
+  <button id="full" title="Maximize">⛶</button>
+</div>
+<div id="layers"></div>
+<div id="info"></div>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const $ = (id) => document.getElementById(id);
+const send = (type, data = {}) => window.parent.postMessage({ isStreamlitMessage: true, type, ...data }, "*");
+
+// ---------- scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.autoClear = false;
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+scene.add(new THREE.HemisphereLight(0xffffff, 0x666666, 1.2));
+const camera = new THREE.PerspectiveCamera(30, 1, 0.01, 1000);
+camera.add(new THREE.DirectionalLight(0xffffff, 1.8));  // headlight, like VTK
+scene.add(camera);
+
+let controls = null, url = null, model = null, args = null, height = 600, radius = 1, grid = null;
+const layers = [];  // {obj, ext, meshes: [{mesh, points}]}
+const picked = [], markers = new THREE.Group();
+scene.add(markers);
+
+let dirty = true, lastBrightness = null;
+const draw = () => (dirty = true);
+
+// ---------- text sprites ----------
+function label(text, color, px = 48) {
+  const c = document.createElement("canvas"), ctx = c.getContext("2d");
+  ctx.font = `${px}px sans-serif`;
+  c.width = Math.ceil(ctx.measureText(text).width) + 8; c.height = px + 8;
+  ctx.font = `${px}px sans-serif`; ctx.fillStyle = color; ctx.textBaseline = "middle";
+  ctx.fillText(text, 4, c.height / 2);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false, sizeAttenuation: false }));
+  s.userData.aspect = c.width / c.height;
+  s.scale.set(s.userData.aspect, 1, 1);
+  return s;
+}
+
+// ---------- axes gizmo (bottom-left corner, like plotter.add_axes) ----------
+const gizmoScene = new THREE.Scene(), gizmoCam = new THREE.OrthographicCamera(-1.6, 1.6, 1.6, -1.6, 0.1, 10);
+[["X", 0xff0000, [1, 0, 0]], ["Y", 0x00aa00, [0, 1, 0]], ["Z", 0x0000ff, [0, 0, 1]]].forEach(([t, col, d]) => {
+  const v = new THREE.Vector3(...d);
+  gizmoScene.add(new THREE.ArrowHelper(v, new THREE.Vector3(), 1, col, 0.25, 0.12));
+  const s = label(t, "#" + col.toString(16).padStart(6, "0"));
+  s.material.sizeAttenuation = true; s.scale.multiplyScalar(0.35); s.position.copy(v.multiplyScalar(1.3));
+  gizmoScene.add(s);
+});
+
+// ---------- bounding grid with tick labels (like plotter.show_grid) ----------
+function niceTicks(a, b, n = 5) {
+  const step0 = (b - a) / n || 1, mag = 10 ** Math.floor(Math.log10(step0));
+  const step = [1, 2, 5, 10].map((m) => m * mag).find((s) => s >= step0);
+  const out = [];
+  for (let v = Math.ceil(a / step) * step; v <= b + step * 1e-6; v += step) out.push(v);
+  return { ticks: out, digits: Math.max(0, -Math.floor(Math.log10(step))) };
+}
+function makeGrid(box) {
+  const g = new THREE.Group(), pos = [], { min, max } = box;
+  const size = box.getSize(new THREE.Vector3()).length(), h = 0.03;
+  for (let ax = 0; ax < 3; ax++) {
+    const { ticks, digits } = niceTicks(min.getComponent(ax), max.getComponent(ax));
+    const o1 = (ax + 1) % 3, o2 = (ax + 2) % 3;
+    for (const t of ticks) {  // gridlines on the two "min" faces + label on the min edge
+      for (const [o, other] of [[o1, o2], [o2, o1]]) {
+        const a = min.clone().setComponent(ax, t), b = a.clone().setComponent(o, max.getComponent(o));
+        pos.push(...a.toArray(), ...b.toArray());
+      }
+      const s = label(t.toFixed(digits), "#444", 40);
+      s.scale.set(h * s.userData.aspect, h, 1);
+      s.center.set(1, 0.5);
+      s.position.copy(min).setComponent(ax, t).addScalar(-size * 0.01).setComponent(ax, t);
+      g.add(s);
+    }
+    const s = label("XYZ"[ax], "#000", 40);
+    s.scale.set(h * s.userData.aspect, h, 1);
+    s.position.copy(min).setComponent(ax, max.getComponent(ax) + size * 0.05);
+    g.add(s);
+  }
+  const c = [min, max];  // 12 box edges
+  for (let i = 0; i < 8; i++) for (let ax = 0; ax < 3; ax++) if (!((i >> ax) & 1)) {
+    const a = new THREE.Vector3(c[i & 1].x, c[(i >> 1) & 1].y, c[(i >> 2) & 1].z);
+    pos.push(...a.toArray(), ...a.clone().setComponent(ax, max.getComponent(ax)).toArray());
+  }
+  const geo = new THREE.BufferGeometry().setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.add(new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: 0x888888, transparent: true, opacity: 0.6 })));
+  return g;
+}
+
+// ---------- materials / styles ----------
+let disc = null;  // round shaded sprite for render_points_as_spheres
+function discTexture() {
+  if (disc) return disc;
+  const c = document.createElement("canvas"); c.width = c.height = 64;
+  const ctx = c.getContext("2d"), gr = ctx.createRadialGradient(24, 24, 2, 32, 32, 31);
+  gr.addColorStop(0, "#fff"); gr.addColorStop(1, "#999");
+  ctx.fillStyle = gr; ctx.beginPath(); ctx.arc(32, 32, 31, 0, 7); ctx.fill();
+  return (disc = new THREE.CanvasTexture(c));
+}
+function transparency(m, op) {
+  m.opacity = op; m.transparent = op < 1; m.depthWrite = op >= 1;
+}
+function pointsMaterial(ext, src) {
+  const m = new THREE.PointsMaterial({
+    size: Math.max(ext.pointSize, 1.5) * window.devicePixelRatio, sizeAttenuation: false,
+    vertexColors: src.vertexColors, color: src.vertexColors ? 0xffffff : src.color,
+    map: ext.spheres ? discTexture() : null, alphaTest: ext.spheres ? 0.5 : 0,
+  });
+  transparency(m, ext.opacity);
+  return m;
+}
+function setupLayer(node) {
+  const ext = node.userData, meshes = [];
+  node.traverse((o) => {
+    if (o.isPoints) o.material = pointsMaterial(ext, o.material);
+    else if (o.isLineSegments) transparency(o.material, ext.opacity);
+    else if (o.isMesh) {
+      const src = { vertexColors: o.material.vertexColors, color: o.material.color };
+      if (o.material.map) o.material.vertexColors = false;  // vertex colors are only for the "points" view
+      transparency(o.material, ext.opacity);
+      const pts = new THREE.Points(o.geometry, pointsMaterial({ ...ext, spheres: false, pointSize: Math.max(ext.pointSize, 2) }, src));
+      pts.visible = false;
+      o.add(pts);  // child: inherits the node's dequantization transform
+      meshes.push({ mesh: o, points: pts });
+    }
+  });
+  return { obj: node, ext, meshes };
+}
+function applyBrightness(v) {  // texture x color multiplier on the GPU, no reload
+  $("bright").value = v;
+  for (const L of layers) for (const { mesh, points } of L.meshes)
+    if (mesh.material.map) { mesh.material.color.setScalar(v); points.material.color.setScalar(v); }
+  draw();
+}
+$("bright").oninput = (e) => applyBrightness(+e.target.value);
+function applyStyle(style) {
+  for (const L of layers) for (const { mesh, points } of L.meshes) {
+    const s = style === "surface" ? L.ext.style : style;
+    mesh.material.visible = s !== "points";  // not mesh.visible: that would hide the child points too
+    mesh.material.wireframe = s === "wireframe";
+    points.visible = s === "points";
+  }
+  draw();
+}
+
+// ---------- camera ----------
+function setCamera(c) {
+  camera.fov = c.viewAngle;
+  camera.position.fromArray(c.position);
+  camera.up.fromArray(c.up);
+  if (!controls) {  // OrbitControls reads camera.up only in its constructor
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.PAN };
+    controls.listenToKeyEvents(window);
+    controls.addEventListener("change", draw);
+  }
+  controls.target.fromArray(c.focal);
+  camera.near = radius / 1000; camera.far = radius * 1000;
+  camera.updateProjectionMatrix();
+  controls.update();
+  draw();
+}
+
+// ---------- render loop ----------
+function resize() {
+  const w = document.body.clientWidth, h = document.fullscreenElement ? window.innerHeight : height;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  draw();
+}
+(function loop() {
+  requestAnimationFrame(loop);
+  controls?.update();
+  if (!dirty) return;
+  dirty = false;
+  const w = renderer.domElement.clientWidth, h = renderer.domElement.clientHeight;
+  renderer.setScissorTest(false); renderer.setViewport(0, 0, w, h);
+  renderer.clear();
+  renderer.render(scene, camera);
+  if (args?.axes && controls) {
+    const s = Math.min(w, h) * 0.2;
+    gizmoCam.position.copy(camera.position).sub(controls.target).setLength(5);
+    gizmoCam.up.copy(camera.up); gizmoCam.lookAt(0, 0, 0);
+    renderer.setViewport(0, 0, s, s); renderer.setScissor(0, 0, s, s); renderer.setScissorTest(true);
+    renderer.clearDepth();
+    renderer.render(gizmoScene, gizmoCam);
+  }
+})();
+
+// ---------- toolbar ----------
+const isOn = (id) => $(id).classList.contains("on"), toggle = (id, on) => $(id).classList.toggle("on", on);
+document.querySelectorAll("[data-style]").forEach((b) => b.onclick = () => {
+  document.querySelectorAll("[data-style]").forEach((x) => x.classList.toggle("on", x === b));
+  applyStyle(b.dataset.style);
+});
+$("pan").onclick = () => {
+  toggle("pan", !isOn("pan"));
+  controls.mouseButtons.LEFT = isOn("pan") ? THREE.MOUSE.PAN : THREE.MOUSE.ROTATE;
+};
+$("pick").onclick = () => toggle("pick", !isOn("pick"));
+$("undo").onclick = () => { if (picked.length) { picked.pop(); markers.remove(markers.children.at(-1)); sendPicked(); draw(); } };
+$("home").onclick = () => args && setCamera(args.camera);
+$("layersBtn").onclick = () => { const s = $("layers").style; s.display = s.display === "block" ? "none" : "block"; };
+$("full").onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+document.addEventListener("fullscreenchange", () => { toggle("full", !!document.fullscreenElement); resize(); });
+
+function buildLayerPanel() {
+  $("layers").innerHTML = "";
+  layers.forEach((L, i) => {
+    const row = document.createElement("label"), cb = document.createElement("input"), sw = document.createElement("i");
+    cb.type = "checkbox"; cb.checked = true;
+    cb.onchange = () => { L.obj.visible = cb.checked; draw(); };
+    sw.style.background = `rgb(${L.ext.color.map((c) => c * 255).join(",")})`;
+    row.append(cb, sw, L.ext.label || `Layer ${i + 1}`);
+    $("layers").append(row);
+  });
+  $("layersBtn").style.display = layers.length > 1 ? "" : "none";
+}
+
+// ---------- picking ----------
+const ray = new THREE.Raycaster();
+let down = null;
+renderer.domElement.addEventListener("pointerdown", (e) => (down = [e.clientX, e.clientY]));
+renderer.domElement.addEventListener("pointerup", (e) => {
+  if (!isOn("pick") || e.button !== 0 || !down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 4) return;
+  const r = renderer.domElement.getBoundingClientRect();
+  ray.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1), camera);
+  ray.params.Points.threshold = radius * 0.005;
+  const targets = [];
+  model?.traverseVisible((o) => (o.isMesh || o.isPoints) && targets.push(o));
+  const hit = ray.intersectObjects(targets, false)[0];
+  if (!hit) return;
+  const m = new THREE.Mesh(new THREE.SphereGeometry(radius * 0.008, 16, 12), new THREE.MeshBasicMaterial({ color: 0xff00ff }));
+  m.position.copy(hit.point); markers.add(m); draw();
+  picked.push(hit.point.toArray().map((v) => +v.toFixed(6)));
+  sendPicked();
+});
+function sendPicked() {
+  $("info").textContent = picked.length ? `${picked.length} point(s) added` : "";
+  send("streamlit:setComponentValue", { value: { points: picked }, dataType: "json" });
+}
+
+// ---------- load: zlib-compressed GLB, inflated natively by the browser ----------
+async function load(u) {
+  $("msg").style.display = "grid"; $("msg").textContent = "Loading…";
+  const t0 = performance.now();
+  const res = await fetch(u);
+  if (!res.ok) throw new Error(res.status);
+  const buf = await new Response(res.body.pipeThrough(new DecompressionStream("deflate"))).arrayBuffer();
+  const g = await new GLTFLoader().parseAsync(buf, "");
+  if (model) scene.remove(model);
+  model = g.scene;
+  scene.add(model);
+  layers.length = 0;
+  model.children.forEach((n) => layers.push(setupLayer(n)));
+  applyStyle(document.querySelector("[data-style].on").dataset.style);
+  buildLayerPanel();
+  applyBrightness(args.brightness);
+  const textured = layers.some((L) => L.meshes.some((m) => m.mesh.material.map));
+  $("brightBox").style.display = textured ? "" : "none";
+  $("brightBox").nextElementSibling.style.display = textured ? "" : "none";
+  const box = new THREE.Box3().setFromObject(model);
+  radius = box.getSize(new THREE.Vector3()).length() / 2 || 1;
+  if (grid) scene.remove(grid);
+  grid = args.grid ? makeGrid(box) : null;
+  if (grid) scene.add(grid);
+  setCamera(args.camera);
+  $("msg").style.display = "none";
+  console.log(`st_pv: ${u} loaded in ${(performance.now() - t0).toFixed(0)} ms`);
+}
+
+window.addEventListener("message", (e) => {
+  if (e.data.type !== "streamlit:render") return;
+  args = e.data.args;
+  height = args.height;
+  scene.background = new THREE.Color(args.background);
+  send("streamlit:setFrameHeight", { height });
+  resize();
+  if (args.brightness !== lastBrightness) { lastBrightness = args.brightness; applyBrightness(args.brightness); }
+  if (args.url === url) return;  // rerun with same scene -> nothing to do
+  url = args.url;
+  load(url).catch((err) => { $("msg").style.display = "grid"; $("msg").textContent = "Load failed: " + err; });
+});
+window.addEventListener("resize", resize);
+send("streamlit:componentReady", { apiVersion: 1 });
+</script>
+</body>
+</html>
