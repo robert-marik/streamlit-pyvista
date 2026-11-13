@@ -55,9 +55,9 @@ Mouse: left = rotate, right/middle = pan, wheel = zoom; arrow keys pan.
 
 ### Cache
 
-Scene files are stored in `st_pv/frontend/cache/` and the least recently used ones are deleted
-above `st_pv.CACHE_LIMIT_MB` (default 1024). `st_pv.clear_cache()` deletes everything.
-The package directory must be writable.
+Scene files are stored in a private temporary directory (`/tmp/st_pv-*`, removed when the server
+exits) and served by Streamlit; the installed package is never written to. The least recently used
+files are deleted above `st_pv.CACHE_LIMIT_MB` (default 1024). `st_pv.clear_cache()` deletes everything.
 
 ## Example and tests
 

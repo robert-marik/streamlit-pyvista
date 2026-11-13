@@ -7,11 +7,14 @@ Why it's faster than stpyvista:
 - three.js renders it on the GPU
 """
 
+import atexit
 import hashlib
 import io
 import json
 import os
+import shutil
 import struct
+import tempfile
 import time
 import zlib
 from pathlib import Path
@@ -22,10 +25,13 @@ import streamlit.components.v1 as components
 from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 
 _FRONTEND = Path(__file__).parent / "frontend"
-_CACHE = _FRONTEND / "cache"
+# GLBs live in a private tmp dir, served by a second (file-only) component; removed on exit
+_CACHE = Path(tempfile.mkdtemp(prefix="st_pv-"))
+atexit.register(shutil.rmtree, _CACHE, True)
 _VERSION = hashlib.blake2b(Path(__file__).read_bytes()).digest()  # code change -> new keys, old files age out
 CACHE_LIMIT_MB = 1024  # oldest-used files are deleted above this
 _component = components.declare_component("st_pv", path=str(_FRONTEND))
+_cache_server = components.declare_component("st_pv_cache", path=str(_CACHE))
 
 _STYLE = {0: "points", 1: "wireframe", 2: "surface"}
 
@@ -229,7 +235,6 @@ def _store(name, build):
     if path.exists():
         os.utime(path)  # mtime = last use
         return
-    _CACHE.mkdir(exist_ok=True)
     tmp = path.with_suffix(f".{os.getpid()}.{id(build)}.tmp")
     tmp.write_bytes(build())
     tmp.replace(path)  # atomic, safe with concurrent sessions
@@ -270,7 +275,7 @@ def pv_view(obj, height=600, background="#ffffff", brightness=1.0, key=None, **a
         obj.view_isometric()  # what plotter.show() would do
     pos, focal, up = obj.camera_position
     value = _component(
-        url=f"cache/{name}", background=background, height=height, brightness=brightness,
+        url=f"../{_cache_server.name}/{name}", background=background, height=height, brightness=brightness,
         camera=dict(position=list(pos), focal=list(focal), up=list(up), viewAngle=obj.camera.view_angle),
         axes=obj.renderer.axes_widget is not None,
         grid=obj.renderer.cube_axes_actor is not None,

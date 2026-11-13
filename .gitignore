@@ -1,5 +1,4 @@
 __pycache__/
 .venv/
 dist/
-src/st_pv/frontend/cache/
 examples/scans/

@@ -1,6 +1,6 @@
 [project]
 name = "streamlit-pyvista"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast PyVista viewer for Streamlit (binary glTF + three.js), drop-in for stpyvista"
 readme = "README.md"
 license = "MIT"
